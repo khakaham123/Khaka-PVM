@@ -1,0 +1,193 @@
+diff --git a/Include/internal/pycore_dict.h b/Include/internal/pycore_dict.h
+index a30a79f..3e1d939 100644
+--- a/Include/internal/pycore_dict.h
++++ b/Include/internal/pycore_dict.h
+@@ -13,6 +13,10 @@ extern "C" {
+ #include "pycore_stackref.h"             // _PyStackRef
+ #include "pycore_stats.h"
+ 
++extern Py_ssize_t _PyDict_GetMaxSize(void);
++extern void _PyDict_SetMaxSize(Py_ssize_t max_size);
++extern int _PyDict_CheckSizeLimit(Py_ssize_t size);
++
+ // Unsafe flavor of PyDict_GetItemWithError(): no error checking
+ extern PyObject* _PyDict_GetItemWithError(PyObject *dp, PyObject *key);
+ 
+diff --git a/Objects/dictobject.c b/Objects/dictobject.c
+index c9cc5d8..8b29934 100644
+--- a/Objects/dictobject.c
++++ b/Objects/dictobject.c
+@@ -2042,6 +2042,32 @@ replace_value(PyDictObject *mp, PyObject *key, Py_ssize_t ix,
+     ASSERT_CONSISTENT(mp);
+ }
+ 
++static Py_ssize_t pvm_max_dict_size = -1;
++
++Py_ssize_t
++_PyDict_GetMaxSize(void)
++{
++    return FT_ATOMIC_LOAD_SSIZE_ACQUIRE(pvm_max_dict_size);
++}
++
++void
++_PyDict_SetMaxSize(Py_ssize_t max_size)
++{
++    FT_ATOMIC_STORE_SSIZE_RELEASE(pvm_max_dict_size, max_size);
++}
++
++int
++_PyDict_CheckSizeLimit(Py_ssize_t size)
++{
++    Py_ssize_t limit = _PyDict_GetMaxSize();
++    if (limit > 0 && size >= limit) {
++        PyErr_SetString(PyExc_ValueError,
++                        "DictCapPVM: dictionary size limit exceeded");
++        return -1;
++    }
++    return 0;
++}
++
+ /*
+ Internal routine to insert a new item into the table.
+ Used both by the internal resize routine and by the public insert routine.
+@@ -2060,6 +2086,10 @@ insertdict(PyDictObject *mp,
+     if (_PyDict_HasSplitTable(mp) && PyUnicode_CheckExact(key)) {
+         ix = insert_split_key(mp->ma_keys, key, hash);
+         if (ix != DKIX_EMPTY) {
++            if (mp->ma_values->values[ix] == NULL &&
++                _PyDict_CheckSizeLimit(PyDict_GET_SIZE((PyObject *)mp)) < 0) {
++                goto Fail;
++            }
+             _PyDict_InsertSplitValue(mp, key, value, ix);
+             Py_DECREF(key);
+             Py_DECREF(value);
+@@ -2071,6 +2101,10 @@ insertdict(PyDictObject *mp,
+         ix = _Py_dict_lookup(mp, key, hash, &old_value);
+         if (ix == DKIX_ERROR)
+             goto Fail;
++        if (old_value == NULL &&
++            _PyDict_CheckSizeLimit(PyDict_GET_SIZE((PyObject *)mp)) < 0) {
++            goto Fail;
++        }
+     }
+ 
+     if (old_value == NULL) {
+@@ -4959,6 +4993,12 @@ dict_setdefault_ref_lock_held(PyObject *d, PyObject *key, PyObject *default_valu
+             PyObject *value = mp->ma_values->values[ix];
+             int already_present = value != NULL;
+             if (!already_present) {
++                if (_PyDict_CheckSizeLimit(PyDict_GET_SIZE((PyObject *)mp)) < 0) {
++                    if (result) {
++                        *result = NULL;
++                    }
++                    return -1;
++                }
+                 _PyDict_InsertSplitValue(mp, key, default_value, ix);
+                 value = default_value;
+             }
+@@ -4980,6 +5020,12 @@ dict_setdefault_ref_lock_held(PyObject *d, PyObject *key, PyObject *default_valu
+     }
+ 
+     if (ix == DKIX_EMPTY || value == NULL) {
++        if (_PyDict_CheckSizeLimit(PyDict_GET_SIZE((PyObject *)mp)) < 0) {
++            if (result) {
++                *result = NULL;
++            }
++            return -1;
++        }
+         value = default_value;
+ 
+         // See comment to this function in insertdict.
+@@ -7654,6 +7700,10 @@ store_instance_attr_lock_held(PyObject *obj, PyDictValues *values,
+         (void)_PyObject_SetAttributeErrorContext(obj, name);
+         return -1;
+     }
++    if (old_value == NULL && value != NULL &&
++        _PyDict_CheckSizeLimit(values->size) < 0) {
++        return -1;
++    }
+ 
+     if (dict) {
+         PyDict_WatchEvent event = (old_value == NULL ? PyDict_EVENT_ADDED :
+diff --git a/Python/bytecodes.c b/Python/bytecodes.c
+index c6f1f61..ff24fb5 100644
+--- a/Python/bytecodes.c
++++ b/Python/bytecodes.c
+@@ -3085,7 +3085,8 @@ dummy_func(
+             assert(Py_TYPE(owner_o)->tp_dictoffset < 0);
+             assert(Py_TYPE(owner_o)->tp_flags & Py_TPFLAGS_INLINE_VALUES);
+             if (_PyObject_GetManagedDict(owner_o) ||
+-                    !FT_ATOMIC_LOAD_UINT8(_PyObject_InlineValues(owner_o)->valid)) {
++                    !FT_ATOMIC_LOAD_UINT8(_PyObject_InlineValues(owner_o)->valid) ||
++                    _PyDict_GetMaxSize() > 0) {
+                 UNLOCK_OBJECT(owner_o);
+                 EXIT_IF(true);
+             }
+diff --git a/Python/generated_cases.c.h b/Python/generated_cases.c.h
+index 3af7863..2059915 100644
+--- a/Python/generated_cases.c.h
++++ b/Python/generated_cases.c.h
+@@ -12082,7 +12082,8 @@
+                 assert(Py_TYPE(owner_o)->tp_dictoffset < 0);
+                 assert(Py_TYPE(owner_o)->tp_flags & Py_TPFLAGS_INLINE_VALUES);
+                 if (_PyObject_GetManagedDict(owner_o) ||
+-                    !FT_ATOMIC_LOAD_UINT8(_PyObject_InlineValues(owner_o)->valid)) {
++                    !FT_ATOMIC_LOAD_UINT8(_PyObject_InlineValues(owner_o)->valid) ||
++                    _PyDict_GetMaxSize() > 0) {
+                     UNLOCK_OBJECT(owner_o);
+                     if (true) {
+                         UPDATE_MISS_STATS(STORE_ATTR);
+diff --git a/Python/sysmodule.c b/Python/sysmodule.c
+index f8c72b0..9b4c7f2 100644
+--- a/Python/sysmodule.c
++++ b/Python/sysmodule.c
+@@ -18,6 +18,7 @@ Data members:
+ #include "pycore_audit.h"         // _Py_AuditHookEntry
+ #include "pycore_call.h"          // _PyObject_CallNoArgs()
+ #include "pycore_ceval.h"         // _PyEval_SetAsyncGenFinalizer()
++#include "pycore_dict.h"          // _PyDict_GetMaxSize()
+ #include "pycore_frame.h"         // _PyInterpreterFrame
+ #include "pycore_import.h"        // _PyImport_SetDLOpenFlags()
+ #include "pycore_initconfig.h"    // _PyStatus_EXCEPTION()
+@@ -1909,6 +1910,23 @@ sys_set_int_max_str_digits_impl(PyObject *module, int maxdigits)
+     Py_RETURN_NONE;
+ }
+ 
++static PyObject *
++sys_get_max_dict_size(PyObject *module, PyObject *Py_UNUSED(ignored))
++{
++    return PyLong_FromSsize_t(_PyDict_GetMaxSize());
++}
++
++static PyObject *
++sys_set_max_dict_size(PyObject *module, PyObject *limit_object)
++{
++    Py_ssize_t limit = PyLong_AsSsize_t(limit_object);
++    if (limit == -1 && PyErr_Occurred()) {
++        return NULL;
++    }
++    _PyDict_SetMaxSize(limit);
++    Py_RETURN_NONE;
++}
++
+ size_t
+ _PySys_GetSizeOf(PyObject *o)
+ {
+@@ -2909,6 +2927,8 @@ static PyMethodDef sys_methods[] = {
+     SYS_GETUNICODEINTERNEDSIZE_METHODDEF
+     SYS_GETFILESYSTEMENCODING_METHODDEF
+     SYS_GETFILESYSTEMENCODEERRORS_METHODDEF
++    {"get_max_dict_size", sys_get_max_dict_size, METH_NOARGS,
++     "Return the current dictionary size limit."},
+ #ifdef Py_TRACE_REFS
+     {"getobjects", _Py_GetObjects, METH_VARARGS},
+ #endif
+@@ -2925,6 +2945,8 @@ static PyMethodDef sys_methods[] = {
+     SYS_IS_FINALIZING_METHODDEF
+     SYS_MDEBUG_METHODDEF
+     SYS_SETSWITCHINTERVAL_METHODDEF
++    {"set_max_dict_size", sys_set_max_dict_size, METH_O,
++     "Set the dictionary size limit; non-positive values disable it."},
+     SYS_GETSWITCHINTERVAL_METHODDEF
+     SYS_SETDLOPENFLAGS_METHODDEF
+     SYS_SETPROFILE_METHODDEF
